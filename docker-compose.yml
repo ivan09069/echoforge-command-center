@@ -1,0 +1,28 @@
+services:
+  security-server:
+    build: .
+    command: python security_server.py
+    ports:
+      - "8002:8002"
+    environment:
+      - MCP_PORT=8002
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/sse')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  command-center:
+    build: .
+    command: python web_ui.py
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - MCP_SERVER_URL=https://echoforge-mcp.jivantorres9.workers.dev/sse
+      - MCP_SECURITY_URL=http://security-server:8002/sse
+      - PORT=8000
+    depends_on:
+      security-server:
+        condition: service_healthy
