@@ -15,6 +15,7 @@ Must emit one of: ALLOW, ALLOW_WITH_CONDITIONS, REJECT, ESCALATE
 import os
 import json
 import logging
+from operator_security import READ_ONLY_TOOLS, call_readonly_tool, require_remote_safe
 
 import google.genai as genai
 from google.genai import types as gt
@@ -96,22 +97,11 @@ class SecurityAgent:
         await self.session.initialize()
 
         result = await self.session.list_tools()
-        decls = [_mcp_to_gemini(t) for t in result.tools]
+        decls = [_mcp_to_gemini(t) for t in result.tools if t.name in READ_ONLY_TOOLS['security']]
         logger.info(f"Security tools: {[d.name for d in decls]}")
 
-        try:
-            res = await self.session.list_resources()
-            self.resource_uris = [r.uri for r in res.resources]
-            if self.resource_uris:
-                decls.append(gt.FunctionDeclaration(
-                    name="read_resource",
-                    description=f"Read MCP resource. URIs: {', '.join(str(u) for u in self.resource_uris)}",
-                    parameters={"type": "OBJECT", "properties": {
-                        "uri": {"type": "STRING", "description": "Resource URI"}
-                    }, "required": ["uri"]},
-                ))
-        except Exception:
-            pass
+        # Resource contents are not exposed to remote models.
+        self.resource_uris = []
 
         self.gemini_tools = [gt.Tool(function_declarations=decls)]
 
@@ -122,13 +112,12 @@ class SecurityAgent:
             await self._streams.__aexit__(None, None, None)
 
     async def _call_tool(self, name: str, args: dict) -> str:
-        if name == "read_resource":
-            r = await self.session.read_resource(args["uri"])
-            return "\n".join(c.text for c in r.contents if hasattr(c, "text"))
-        r = await self.session.call_tool(name, args)
-        return "\n".join(c.text for c in r.content if hasattr(c, "text"))
+        return await call_readonly_tool(self.session, 'security', name, args)
 
     async def chat(self, message: str, history: list[dict] | None = None) -> str:
+        require_remote_safe(message)
+        for item in history or []:
+            require_remote_safe(item.get('content', ''))
         contents = []
         if history:
             for m in history:

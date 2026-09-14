@@ -62,3 +62,25 @@ ARCHITECTURE.md     — Canonical operating model
 | "Optimize bot but check safety" | Both → Merged | ALLOW (security veto enabled) |
 | "Buy $500 DOGE from MEV Signer1" | Claude | REQUIRE_APPROVAL → policy violations |
 | "Decrypt wallet_69.json" | Gemini (reclassified HIGH) | ALLOW (local-only) |
+
+## Enforced operator boundary
+
+Set `OPERATOR_TOKEN` to a unique random secret of at least 32 characters in the
+server environment. Use HTTPS. The web interface accepts it in the password field
+and sends it as the first WebSocket frame, never in a URL or browser storage.
+The audit endpoint requires the same token as a Bearer header. Missing credentials
+fail closed before any provider request.
+
+Both agent adapters now restrict tool discovery and dispatch to the explicit
+read-only names in `operator_security.py`. Resource reads and unknown/write tools
+are denied. Candidate secrets and high-sensitivity text are rejected before remote
+classification, model calls, and tool-result forwarding. Detection is heuristic;
+these checks do not replace isolation or an independently secured MCP server.
+The approval UI records analysis only; it does not claim that a chat reply executed
+a trade. Local-only workflows require a separate local processing implementation.
+
+Offline boundary tests (no dependencies or provider calls):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_operator_security.py test_operator_routes.py
+```
