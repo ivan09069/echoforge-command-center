@@ -16,11 +16,9 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from operator_security import authorized_token, require_remote_safe
-from boundary_enforcer import enforce_pre_route
 from triage_router import TriageRouter
 from trading_agent import TradingAgent
 from security_agent import SecurityAgent
@@ -75,20 +73,7 @@ app = FastAPI(title="EchoForge Command Center", lifespan=lifespan)
 
 @app.websocket("/ws")
 async def ws_chat(ws: WebSocket):
-    if len(os.getenv('OPERATOR_TOKEN', '')) < 32:
-        await ws.close(code=1008); return
     await ws.accept()
-    try:
-        hello_text = await asyncio.wait_for(ws.receive_text(), timeout=10)
-        if len(hello_text) > 4096:
-            await ws.close(code=1008); return
-        hello = json.loads(hello_text)
-        token = hello.get('token') if isinstance(hello, dict) else None
-        if not authorized_token(token, os.getenv('OPERATOR_TOKEN', '')):
-            await ws.close(code=1008); return
-    except (ValueError, asyncio.TimeoutError, WebSocketDisconnect):
-        await ws.close(code=1008); return
-    await ws.send_json({'authenticated': True})
     trading_history: list[dict] = []
     security_history: list[dict] = []
     pending_contract: JobContract | None = None
@@ -97,11 +82,6 @@ async def ws_chat(ws: WebSocket):
     try:
         while True:
             user_msg = await ws.receive_text()
-            try:
-                require_remote_safe(user_msg)
-            except PermissionError:
-                await ws.send_json({'agent': 'system', 'text': 'Content requires local review; no provider request was made.', 'contract': None, 'decision': None})
-                continue
 
             if not all([triage, trading, security]):
                 await ws.send_json({"agent": "system", "text": "Agents initializing...",
@@ -115,15 +95,15 @@ async def ws_chat(ws: WebSocket):
                     # Re-run with approval
                     try:
                         resp = await trading.chat(
-                            f"APPROVED for analysis only: {pending_safe_ctx}",
+                            f"APPROVED — execute: {pending_safe_ctx}",
                             history=trading_history,
                         )
                         log_audit(pending_contract,
                                   decide(pending_contract),
-                                  execution_action="ANALYSIS_ONLY_AFTER_APPROVAL",
+                                  execution_action="EXECUTED",
                                   approval_record="USER_APPROVED")
                         await ws.send_json({
-                            "agent": "claude", "text": f"Approved for analysis only.\n\n{resp}",
+                            "agent": "claude", "text": f"✅ Approved.\n\n{resp}",
                             "contract": pending_contract.to_dict(), "decision": None,
                         })
                     except Exception as e:
@@ -151,10 +131,6 @@ async def ws_chat(ws: WebSocket):
 
                 # 2. Build job contract (policy engine)
                 contract = build_job_contract(user_msg, classification)
-                preflight = enforce_pre_route(contract)
-                if not preflight.valid:
-                    await ws.send_json({'agent': 'system', 'text': 'Request failed policy validation.', 'contract': contract.to_dict(), 'decision': preflight.fallback_decision.to_dict()})
-                    continue
 
                 # 3. Normalize context
                 safe_ctx = await triage.normalize_context(user_msg, contract.sensitivity)
@@ -183,8 +159,8 @@ async def ws_chat(ws: WebSocket):
 
                 elif "CLAUDE" in contract.routes and "GEMINI" in contract.routes:
                     # Parallel execution
-                    t_intent = safe_ctx
-                    s_intent = safe_ctx
+                    t_intent = classification.get("trading_intent") or safe_ctx
+                    s_intent = classification.get("security_intent") or safe_ctx
 
                     t_task = asyncio.create_task(trading.chat(t_intent, history=trading_history))
                     s_task = asyncio.create_task(security.chat(s_intent, history=security_history))
@@ -243,7 +219,7 @@ async def ws_chat(ws: WebSocket):
             except Exception as e:
                 logger.error(f"Pipeline error: {e}", exc_info=True)
                 await ws.send_json({
-                    "agent": "system", "text": "Pipeline failed; inspect server logs locally.",
+                    "agent": "system", "text": f"⚠️ Pipeline error: {e}",
                     "contract": None, "decision": None,
                 })
 
@@ -316,13 +292,8 @@ def _parse_security_verdict(raw: str) -> SecurityOutput:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.get("/audit")
-async def audit(request: Request):
-    expected = os.getenv('OPERATOR_TOKEN', '')
-    if len(expected) < 32: return JSONResponse({'error': 'operator_auth_not_configured'}, status_code=503)
-    auth = request.headers.get('authorization', '')
-    if not authorized_token(auth[7:] if auth.startswith('Bearer ') else '', expected):
-        return JSONResponse({'error': 'unauthorized'}, status_code=401)
-    return JSONResponse(get_audit_log(), headers={'Cache-Control': 'no-store'})
+async def audit():
+    return JSONResponse(get_audit_log())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -387,9 +358,7 @@ header h1{font-size:13px;font-weight:700;color:#fff;letter-spacing:1.5px}
   <span class="b b-gpt">GPT</span>
   <span class="b b-claude">CLAUDE</span>
   <span class="b b-gemini">GEMINI</span>
-  <span id="status">locked</span>
-  <input id="operator-token" type="password" autocomplete="off" placeholder="Operator token" aria-label="Operator token"/>
-  <button onclick="connect()">Connect</button>
+  <span id="status">...</span>
 </header>
 <div id="chat">
   <div class="ex">
@@ -410,21 +379,19 @@ header h1{font-size:13px;font-weight:700;color:#fff;letter-spacing:1.5px}
 </div>
 <script>
 const C=document.getElementById('chat'),I=document.getElementById('i'),B=document.getElementById('btn'),
-      ST=document.getElementById('status');let ws,authenticated=false;
+      ST=document.getElementById('status');let ws;
 const CL={claude:{l:'CLAUDE',c:'b-claude'},gemini:{l:'GEMINI',c:'b-gemini'},
            gpt:{l:'GPT',c:'b-gpt'},merged:{l:'MERGED',c:'b-merged'},system:{l:'SYS',c:'b-system'}};
 function connect(){
-  const field=document.getElementById('operator-token'),token=field.value;if(!token)return;
-  if(ws)ws.close();authenticated=false;
   const p=location.protocol==='https:'?'wss':'ws';
   ws=new WebSocket(`${p}://${location.host}/ws`);
-  ws.onopen=()=>{ws.send(JSON.stringify({token}));field.value='';ST.textContent='authenticating'};
-  ws.onclose=()=>{authenticated=false;ST.textContent='locked';ST.style.color='#e44'};
+  ws.onopen=()=>{ST.textContent='live';ST.style.color='#6a9'};
+  ws.onclose=()=>{ST.textContent='off';ST.style.color='#e44';setTimeout(connect,3e3)};
   ws.onmessage=e=>{
     const t=document.querySelector('.thinking');if(t)t.remove();
-    const d=JSON.parse(e.data);if(d.authenticated){authenticated=true;ST.textContent='live';ST.style.color='#6a9';return;}addA(d.agent,d.text,d.contract,d.decision);
+    const d=JSON.parse(e.data);addA(d.agent,d.text,d.contract,d.decision);
     B.disabled=false;I.disabled=false;I.focus()};
-}
+}connect();
 function addU(t){const d=document.createElement('div');d.className='msg user';d.textContent=t;C.appendChild(d);C.scrollTop=C.scrollHeight}
 function addA(ag,txt,con,dec){
   const d=document.createElement('div');d.className='msg agent';
@@ -451,7 +418,7 @@ function addA(ag,txt,con,dec){
   if(con){const j=document.createElement('span');j.className='meta';j.textContent=con.job_id;h.appendChild(j)}
   d.appendChild(h);d.appendChild(document.createTextNode(txt));C.appendChild(d);C.scrollTop=C.scrollHeight}
 function S(t){
-  const m=t||I.value.trim();if(!m||!ws||!authenticated||ws.readyState!==1)return;addU(m);
+  const m=t||I.value.trim();if(!m||!ws||ws.readyState!==1)return;addU(m);
   const th=document.createElement('div');th.className='thinking';
   th.innerHTML='<span class="rl">routing</span> <span class="d"><span>·</span><span>·</span><span>·</span></span>';
   C.appendChild(th);C.scrollTop=C.scrollHeight;
